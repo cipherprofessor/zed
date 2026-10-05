@@ -778,9 +778,15 @@ impl Object {
             Object::VerticalBars => {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '|', '|')
             }
-            Object::Parentheses => {
-                surrounding_markers(map, relative_to, around, self.is_multiline(), '(', ')')
-            }
+            Object::Parentheses => surrounding_markers_with_count(
+                map,
+                relative_to,
+                around,
+                self.is_multiline(),
+                '(',
+                ')',
+                times.unwrap_or(1),
+            ),
             Object::Tag => {
                 let head = selection.head();
                 let range = selection.range();
@@ -850,15 +856,33 @@ impl Object {
                 innermost_surrounding_pair(map, cursor)
                     .map(|pair| pair.to_display_range(map, around))
             }
-            Object::SquareBrackets => {
-                surrounding_markers(map, relative_to, around, self.is_multiline(), '[', ']')
-            }
-            Object::CurlyBrackets => {
-                surrounding_markers(map, relative_to, around, self.is_multiline(), '{', '}')
-            }
-            Object::AngleBrackets => {
-                surrounding_markers(map, relative_to, around, self.is_multiline(), '<', '>')
-            }
+            Object::SquareBrackets => surrounding_markers_with_count(
+                map,
+                relative_to,
+                around,
+                self.is_multiline(),
+                '[',
+                ']',
+                times.unwrap_or(1),
+            ),
+            Object::CurlyBrackets => surrounding_markers_with_count(
+                map,
+                relative_to,
+                around,
+                self.is_multiline(),
+                '{',
+                '}',
+                times.unwrap_or(1),
+            ),
+            Object::AngleBrackets => surrounding_markers_with_count(
+                map,
+                relative_to,
+                around,
+                self.is_multiline(),
+                '<',
+                '>',
+                times.unwrap_or(1),
+            ),
             Object::Method => text_object(
                 map,
                 relative_to,
@@ -1763,6 +1787,39 @@ pub fn end_of_paragraph(map: &DisplaySnapshot, display_point: DisplayPoint) -> D
     map.max_point()
 }
 
+/// Finds the closest unmatched opening marker before `point`.
+fn enclosing_opening_marker(
+    map: &DisplaySnapshot,
+    point: MultiBufferOffset,
+    search_across_lines: bool,
+    open_marker: char,
+    close_marker: char,
+) -> Option<Range<MultiBufferOffset>> {
+    let mut matched_closes = 0;
+    let mut chars_before = movement::chars_before(map, point).peekable();
+    while let Some((ch, range)) = chars_before.next() {
+        if ch == '\n' && !search_across_lines {
+            break;
+        }
+
+        if let Some((before_ch, _)) = chars_before.peek()
+            && *before_ch == '\\'
+        {
+            continue;
+        }
+
+        if ch == open_marker {
+            if matched_closes == 0 {
+                return Some(range);
+            }
+            matched_closes -= 1;
+        } else if ch == close_marker {
+            matched_closes += 1
+        }
+    }
+    None
+}
+
 pub fn surrounding_markers(
     map: &DisplaySnapshot,
     relative_to: DisplayPoint,
@@ -1771,9 +1828,30 @@ pub fn surrounding_markers(
     open_marker: char,
     close_marker: char,
 ) -> Option<Range<DisplayPoint>> {
+    surrounding_markers_with_count(
+        map,
+        relative_to,
+        around,
+        search_across_lines,
+        open_marker,
+        close_marker,
+        1,
+    )
+}
+
+/// Returns the range of the `count`-th pair of markers enclosing `relative_to`,
+/// where a count of 1 is the innermost pair.
+pub fn surrounding_markers_with_count(
+    map: &DisplaySnapshot,
+    relative_to: DisplayPoint,
+    around: bool,
+    search_across_lines: bool,
+    open_marker: char,
+    close_marker: char,
+    count: usize,
+) -> Option<Range<DisplayPoint>> {
     let point = relative_to.to_offset(map, Bias::Left);
 
-    let mut matched_closes = 0;
     let mut opening = None;
 
     let mut before_ch = match movement::chars_before(map, point).next() {
@@ -1803,28 +1881,8 @@ pub fn surrounding_markers(
     }
 
     if opening.is_none() {
-        let mut chars_before = movement::chars_before(map, point).peekable();
-        while let Some((ch, range)) = chars_before.next() {
-            if ch == '\n' && !search_across_lines {
-                break;
-            }
-
-            if let Some((before_ch, _)) = chars_before.peek()
-                && *before_ch == '\\'
-            {
-                continue;
-            }
-
-            if ch == open_marker {
-                if matched_closes == 0 {
-                    opening = Some(range);
-                    break;
-                }
-                matched_closes -= 1;
-            } else if ch == close_marker {
-                matched_closes += 1
-            }
-        }
+        opening =
+            enclosing_opening_marker(map, point, search_across_lines, open_marker, close_marker);
     }
     if opening.is_none() {
         for (ch, range) in movement::chars_after(map, point) {
@@ -1842,6 +1900,17 @@ pub fn surrounding_markers(
     }
 
     let mut opening = opening?;
+
+    // Starting from the opening marker, so the pair just found is not matched again.
+    for _ in 1..count {
+        opening = enclosing_opening_marker(
+            map,
+            opening.start,
+            search_across_lines,
+            open_marker,
+            close_marker,
+        )?;
+    }
 
     let mut matched_opens = 0;
     let mut closing = None;
@@ -3076,6 +3145,102 @@ mod test {
             cx.simulate_keystrokes(keystrokes);
             cx.assert_state(initial_state, *mode);
         }
+    }
+
+    #[gpui::test]
+    async fn test_bracket_objects_with_count(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        // (keystrokes, initial state, expected state)
+        const TEST_CASES: &[(&str, &str, &str)] = &[
+            // A count of 1 (or none) is unchanged.
+            ("d i (", "a(b(c(ˇd)))", "a(b(c(ˇ)))"),
+            ("d 1 i (", "a(b(c(ˇd)))", "a(b(c(ˇ)))"),
+            // The count selects the n-th enclosing pair.
+            ("d 2 i (", "a(b(c(ˇd)))", "a(b(ˇ))"),
+            ("d 3 i (", "a(b(c(ˇd)))", "a(ˇ)"),
+            ("d 2 a (", "a(b(c(ˇd)))", "a(bˇ)"),
+            ("d 3 a (", "a(b(c(ˇd)))", "ˇa"),
+            // Fewer enclosing pairs than the count: nothing happens.
+            ("d 4 i (", "a(b(c(ˇd)))", "a(b(c(ˇd)))"),
+            ("d 4 a (", "a(b(c(ˇd)))", "a(b(c(ˇd)))"),
+            // A sibling pair is not an enclosing pair.
+            ("d 2 i (", "(a)(ˇb)", "(a)(ˇb)"),
+            // A cursor on an opening bracket counts that pair as the first level.
+            ("d 2 i (", "a(b(ˇ(c)))", "a(b(ˇ))"),
+            // Only brackets of the same kind are counted.
+            ("d 2 i (", "a(b[c(ˇd)])", "a(ˇ)"),
+            ("d 2 i [", "[1, [2, [ˇ3]]]", "[1, [ˇ]]"),
+            ("d 2 i {", "{a, {b, {ˇc}}}", "{a, {ˇ}}"),
+            ("d 2 i <", "<a, <b, <ˇc>>>", "<a, <ˇ>>"),
+            ("d 2 a [", "[1, [2, [ˇ3]]]", "[1, ˇ]"),
+            // The count applies to the change operator too.
+            ("c 2 i (", "a(b(c(ˇd)))", "a(b(ˇ))"),
+        ];
+
+        for (keystrokes, initial_state, expected_state) in TEST_CASES {
+            cx.set_state(initial_state, Mode::Normal);
+            cx.simulate_keystrokes(keystrokes);
+            // `c` leaves us in insert mode; the buffer text and cursor are what matter.
+            cx.assert_editor_state(expected_state);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_bracket_objects_with_count_in_visual_mode(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.set_state("a(b(c(ˇd)))", Mode::Normal);
+        cx.simulate_keystrokes("v 2 i (");
+        cx.assert_state("a(b(«c(d)ˇ»))", Mode::Visual);
+
+        cx.set_state("a(b(c(ˇd)))", Mode::Normal);
+        cx.simulate_keystrokes("v 2 a (");
+        cx.assert_state("a(b«(c(d))ˇ»)", Mode::Visual);
+    }
+
+    #[gpui::test]
+    async fn test_bracket_objects_with_count_multiline(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        // https://github.com/zed-industries/zed/issues/54873
+        let initial_state = indoc! {"
+            fn main() {
+                if true {
+                    printlnˇ!(\"hello world\");
+                }
+            }
+        "};
+
+        cx.set_state(initial_state, Mode::Normal);
+        cx.simulate_keystrokes("v i {");
+        cx.assert_state(
+            indoc! {"
+                fn main() {
+                    if true {
+                        «println!(\"hello world\");ˇ»
+                    }
+                }
+            "},
+            Mode::Visual,
+        );
+
+        cx.set_state(initial_state, Mode::Normal);
+        cx.simulate_keystrokes("v 2 i {");
+        cx.assert_state(
+            indoc! {"
+                fn main() {
+                    «if true {
+                        println!(\"hello world\");
+                    }ˇ»
+                }
+            "},
+            Mode::Visual,
+        );
+
+        cx.set_state(initial_state, Mode::Normal);
+        cx.simulate_keystrokes("d 2 i {");
+        cx.assert_state("fn main() {\n   ˇ \n}\n", Mode::Normal);
     }
 
     #[gpui::test]
